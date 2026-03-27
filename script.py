@@ -1,4 +1,5 @@
 from collections import Counter
+import argparse
 import os
 from pathlib import Path
 import re
@@ -159,46 +160,106 @@ def save_outputs(df, out_dir, base_name="words"):
         df.to_excel(writer, index=False, sheet_name="words")
 
 
-def process_all_pdfs(folder_path, outputs_root="outputs"):
+def _latest_mtime(paths):
+    latest = 0.0
+    for p in paths:
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except Exception:
+            continue
+    return latest
+
+
+def _outputs_mtime(out_dir):
+    out_dir = Path(out_dir)
+    csv_path = out_dir / "words.csv"
+    xlsx_path = out_dir / "words.xlsx"
+    if not csv_path.exists() or not xlsx_path.exists():
+        return None
+    return min(csv_path.stat().st_mtime, xlsx_path.stat().st_mtime)
+
+
+def _read_existing_source_pdfs(out_dir):
+    out_dir = Path(out_dir)
+    csv_path = out_dir / "words.csv"
+    if not csv_path.exists():
+        return None
+    try:
+        df = pd.read_csv(csv_path, usecols=["source_pdf"], nrows=1)
+        if df.empty:
+            return set()
+        value = str(df.iloc[0]["source_pdf"] or "")
+        if not value.strip():
+            return set()
+        return set([v.strip() for v in value.split(",") if v.strip()])
+    except Exception:
+        return None
+
+
+def _should_process_term(out_dir, pdf_paths, only_new):
+    if not only_new:
+        return True
+
+    pdf_paths = list(pdf_paths)
+    if not pdf_paths:
+        return False
+
+    out_mtime = _outputs_mtime(out_dir)
+    if out_mtime is None:
+        return True
+
+    current_names = set(p.name for p in pdf_paths)
+    existing_names = _read_existing_source_pdfs(out_dir)
+    if existing_names is None:
+        return True
+    if existing_names != current_names:
+        return True
+
+    latest_pdf_mtime = _latest_mtime(pdf_paths)
+    return latest_pdf_mtime > out_mtime
+
+
+def process_all_pdfs(folder_path, outputs_root="outputs", only_new=False):
     folder_path = Path(folder_path)
     outputs_root = Path(outputs_root)
 
     ensure_nltk_data()
     english_vocab = _build_english_vocab()
 
-    term_counters = {}
-    term_sources = {}
-
+    term_pdfs = {}
     for pdf_path in sorted(folder_path.rglob("*.pdf")):
         year, term = parse_pdf_context(pdf_path, folder_path)
-
-        text = extract_text_from_pdf(str(pdf_path))
-        words = process_text(text, english_vocab)
-
         key = (str(year), str(term))
-        if key not in term_counters:
-            term_counters[key] = Counter()
-            term_sources[key] = []
-
-        term_counters[key].update(words)
-        term_sources[key].append(pdf_path.name)
+        term_pdfs.setdefault(key, []).append(pdf_path)
 
     all_dfs = []
-    for (year, term), counter in term_counters.items():
+    processed_any = False
+
+    for (year, term), pdf_paths in sorted(term_pdfs.items()):
+        out_dir = outputs_root / str(year) / str(term)
+        if not _should_process_term(out_dir, pdf_paths, only_new=only_new):
+            continue
+
+        processed_any = True
+        counter = Counter()
+        for pdf_path in pdf_paths:
+            text = extract_text_from_pdf(str(pdf_path))
+            words = process_text(text, english_vocab)
+            counter.update(words)
+
         total_tokens = int(sum(counter.values()))
         df = pd.DataFrame(counter.items(), columns=["word", "frequency"])
         df["year"] = year
         df["term"] = term
-        df["source_pdf"] = ", ".join(sorted(set(term_sources.get((year, term), []))))
+        df["source_pdf"] = ", ".join(sorted(set(p.name for p in pdf_paths)))
         df["total_tokens"] = total_tokens
         df["relative_freq"] = df["frequency"] / total_tokens if total_tokens else 0.0
         df = df.sort_values(["frequency", "word"], ascending=[False, True], ignore_index=True)
         all_dfs.append(df)
 
-        out_dir = outputs_root / str(year) / str(term)
         save_outputs(df, out_dir, base_name="words")
 
-    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+    return (pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()), processed_any
 
 
 def save_global_dataset(df, outputs_root="outputs"):
@@ -223,14 +284,44 @@ def save_global_dataset(df, outputs_root="outputs"):
         pivot.to_excel(writer, sheet_name="pivot")
 
 
+def load_all_term_outputs(outputs_root="outputs"):
+    outputs_root = Path(outputs_root)
+    parts = []
+    for csv_path in sorted(outputs_root.glob("*/*/words.csv")):
+        if "_all" in csv_path.parts:
+            continue
+        try:
+            parts.append(pd.read_csv(csv_path))
+        except Exception:
+            continue
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
 # ----------------------------
 # ÇALIŞTIR
 # ----------------------------
 if __name__ == "__main__":
-    folder_path = "pdfler"  # PDF klasörün
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pdf-dir", default="pdfler")
+    parser.add_argument("--outputs-dir", default="outputs")
+    parser.add_argument("--only-new", action="store_true")
+    args = parser.parse_args()
 
-    df = process_all_pdfs(folder_path)
+    df_new, processed_any = process_all_pdfs(
+        args.pdf_dir,
+        outputs_root=args.outputs_dir,
+        only_new=args.only_new,
+    )
 
-    if not df.empty:
-        save_global_dataset(df)
-        print(df.groupby("word")["frequency"].sum().sort_values(ascending=False).head(20))
+    if processed_any:
+        df_all = load_all_term_outputs(args.outputs_dir)
+        if not df_all.empty:
+            save_global_dataset(df_all, outputs_root=args.outputs_dir)
+            print(
+                df_all.groupby("word")["frequency"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(20)
+            )
+    else:
+        print("Yeni PDF bulunamadı veya tüm çıktılar güncel.")
