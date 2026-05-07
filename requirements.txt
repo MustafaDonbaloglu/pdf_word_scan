@@ -6,4 +6,5 @@ openpyxl
 streamlit
 matplotlib
 fpdf2
+cefrpy
 
